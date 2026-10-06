@@ -1,0 +1,69 @@
+{
+ "actions": [],
+ "creation": "2026-08-21 00:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "istable": 1,
+ "autoname": "hash",
+ "field_order": [
+  "account",
+  "direction_mode",
+  "cost_centers",
+  "project",
+  "party_type",
+  "party"
+ ],
+ "fields": [
+  {
+   "fieldname": "account",
+   "fieldtype": "Link",
+   "options": "Account",
+   "label": "Account",
+   "reqd": 1,
+   "in_list_view": 1,
+   "description": "Any root type \u2014 unlike a P&L source row, a cash flow line legitimately binds a Liability account (a loan, a payable) or an Equity account (dividends), not only Income/Expense."
+  },
+  {
+   "fieldname": "direction_mode",
+   "fieldtype": "Select",
+   "options": "Net\nDebit Only\nCredit Only",
+   "default": "Net",
+   "label": "Direction Mode",
+   "in_list_view": 1,
+   "description": "Net: every cash-leg movement on this account counts. Debit Only / Credit Only: only movements in that direction count \u2014 the setting that lets 'Riyadh Bank Loan settlement' (Debit Only) and 'Financing from Riyadh Bank' (Credit Only) read the SAME liability account as two distinct, non-overlapping lines instead of one net figure."
+  },
+  {
+   "fieldname": "cost_centers",
+   "fieldtype": "Table MultiSelect",
+   "options": "Insight Cash Flow Binding Cost Center",
+   "label": "Cost Centers",
+   "description": "v2.86.6 \u2014 multiple, mapped once. One binding row now reads from every listed cost centre together (a single 'cost_center IN (...)' query), instead of needing one binding row per cost centre for the same account. Set when the parent line's Dimension field is Cost Center \u2014 how 'Audit' and 'HR' read from the same shared receivables account as two different lines, and how a line that legitimately spans several departments (e.g. a company-wide supplier payment split by cost centre) doesn't need a duplicate binding per department."
+  },
+  {
+   "fieldname": "project",
+   "fieldtype": "Link",
+   "options": "Project",
+   "label": "Project",
+   "description": "Set when the parent line's Dimension field is Project."
+  },
+  {
+   "fieldname": "party_type",
+   "fieldtype": "Link",
+   "options": "DocType",
+   "label": "Party Type",
+   "description": "Employee / Supplier / Customer \u2014 set together with Party when several lines share one account and are told apart only by who the transaction is with (e.g. four management-fee lines on one Payable account, one per person)."
+  },
+  {
+   "fieldname": "party",
+   "fieldtype": "Dynamic Link",
+   "options": "party_type",
+   "label": "Party"
+  }
+ ],
+ "links": [],
+ "modified": "2026-08-21 00:00:00",
+ "module": "Neotec Insight",
+ "name": "Insight Cash Flow Line Binding",
+ "owner": "Administrator",
+ "permissions": []
+}
