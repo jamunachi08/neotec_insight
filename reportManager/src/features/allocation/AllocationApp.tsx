@@ -1,0 +1,955 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { deskPrefix } from '../../utils/desk';
+import { api } from '../../utils/api';
+import { t } from '../../utils/i18n';
+import { NoRulesModal } from './NoRulesModal';
+import { EntriesRecoveryModal } from './EntriesRecoveryModal';
+import { ImportHeadCountsModal } from './ImportHeadCountsModal';
+import { DiagnoseModal, candLabel } from './DiagnoseModal';
+import { fmtD } from '../../utils/format';
+import { setActiveCompany } from '../../utils/activeCompany';
+import { ExportBar } from '../ExportBar';
+import type { DocRow, ReportDoc } from '../../utils/reportdoc';
+import { CaptureModal, EvidenceModal, UnassignedModal } from './CaptureModals';
+
+/* Cost pool allocation (v2.58.0).
+ *
+ * Replaces a spreadsheet that spread GMO cost by head count and Sales &
+ * Marketing cost by leads. The model, kept identical to that workbook so the
+ * numbers tie on day one:
+ *
+ *   distributable = pool - sum(fixed)
+ *   alloc(cc)     = fixed(cc) + distributable * driver(cc) / total_driver
+ *
+ * Two views. **Report** spreads cost centres horizontally — every cost centre
+ * side by side, months down — which is the orientation asked for and the one
+ * that makes the split legible. **Data** is the driver entry grid, the interim
+ * measure until head count comes from HR and leads from CRM automatically.
+ */
+
+type View = 'report' | 'data';
+
+interface Rule {
+  name: string; title: string; company: string; driver_label: string;
+  pool_mode: string; pool_flag?: string; pool_report?: string; driver_source?: string;
+  pool_row_key?: string; pool_cost_center?: string;
+}
+
+interface MonthBlock {
+  pool: number; direct_total: number; distributable: number; driver_total: number;
+  allocation: Record<string, number>; drivers: Record<string, number>;
+  direct: Record<string, number>;
+  allocated: number; residual: number; unallocated: boolean; no_pool?: boolean;
+}
+
+interface RunResult {
+  rule: string; title: string; driver_label: string; company: string; year: number;
+  months: number[]; month_labels: string[];
+  cost_centers: string[]; cost_center_labels: Record<string, string>;
+  by_month: Record<string, MonthBlock>;
+  ytd: Record<string, number>; ytd_pool: number; ytd_residual: number;
+  /** v2.78.0 — entered, never derived. `budget` is per month per cost centre;
+   *  the YTD and variance roll-ups are computed server-side so the screen and
+   *  every export agree on the rounding and the sign. Variance is positive
+   *  when the allocation exceeds budget — an allocation is a cost. */
+  budget?: Record<string, Record<string, number>>;
+  budget_ytd?: Record<string, number>;
+  budget_total?: number;
+  variance_ytd?: Record<string, number>;
+  formula: string; formula_errors: number[]; credit_back: number; pool_source: string;
+  roles: Record<string, Basis | 'mixed' | 'credit'>;
+  mixed: string[];
+  /** v2.89.2 — why the pool is empty, when it is. */
+  pool_status?: {
+    state: string; message: string; report?: string; row_key?: string; cost_center?: string;
+    candidates?: { key: string; label: string; jan?: number; ytd?: number }[];
+  };
+}
+
+/* v2.89.2 — the pool used to fall to zero with no reason shown: a report run
+ * that failed, a row key that no longer exists after the report was rebuilt,
+ * or a row that is genuinely zero all looked the same ("no pool"). */
+function PoolStatus({ status, rule, onFixed }: {
+  status: NonNullable<RunResult['pool_status']>; rule: string; onFixed: () => void;
+}) {
+  const [pick, setPick] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [filter, setFilter] = useState('');
+  if (!status || status.state === 'ok') return null;
+  if (status.state === 'relinked') return <div className="alloc-ok">{status.message}</div>;
+  const cands = (status.candidates || []).filter((c) =>
+    !filter || (c.label + ' ' + c.key).toLowerCase().includes(filter.toLowerCase()));
+  return (
+    <div className="alloc-warn">
+      <strong>{t('The pool could not be read, so every month shows no pool.')}</strong>{' '}
+      {status.message}
+      {status.state === 'error' && <> {t('Details are in the Error Log.')}</>}
+      {status.state === 'row_missing' && !!status.candidates?.length && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 8, flexWrap: 'wrap' }}>
+          <input placeholder={t('Filter rows…')} value={filter} onChange={(e) => setFilter(e.target.value)}
+            style={{ width: 160 }} />
+          <select value={pick} onChange={(e) => setPick(e.target.value)} style={{ minWidth: 280 }}>
+            <option value="">{t('Choose the row that holds the pool…')}</option>
+            {cands.map((c) => <option key={c.key} value={c.key}>{candLabel(c)}</option>)}
+          </select>
+          <button type="button" className="bk-btn bk-primary" disabled={!pick || busy}
+            onClick={async () => {
+              setBusy(true); setErr('');
+              try { await api.allocationSetPoolRow(rule, pick); onFixed(); }
+              catch (e: any) { setErr(e?.message || String(e)); }
+              finally { setBusy(false); }
+            }}>{busy ? t('Saving…') : t('Use this row')}</button>
+          {err && <span className="ni-exp-err">{err}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+type Basis = 'head_count' | 'amount';
+type Cells = Record<string, Record<string, { driver: number; amount: number; budget?: number }>>;
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export function AllocationApp() {
+  const [view, setView] = useState<View>('report');
+  const [companies, setCompanies] = useState<{ name: string; label?: string }[]>([]);
+  const [company, setCompany] = useState('');
+  const [rules, setRules] = useState<Rule[]>([]);
+  const [rule, setRule] = useState('');
+  const [diag, setDiag] = useState<any>(null);
+  const [why, setWhy] = useState(false);
+  const [gridLoaded, setGridLoaded] = useState(false);
+  const [recoverOpen, setRecoverOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [tick, setTick] = useState(0);
+  const [year, setYear] = useState(new Date().getFullYear());
+  // v2.89.0 — the Year box used to reload on every keystroke, so typing 2026
+  // also loaded years 2, 20 and 202. Whichever reply came back last won, and
+  // an empty year-202 grid could land on a 2026 screen: the figures looked
+  // lost while they were still in the database. The box now only commits a
+  // complete year, and every load carries a sequence number so a late reply
+  // is ignored.
+  const [yearText, setYearText] = useState(String(new Date().getFullYear()));
+  const runSeq = useRef(0);
+  const gridSeq = useRef(0);
+  const [entryCount, setEntryCount] = useState<number | null>(null);
+  const [frozenCells, setFrozenCells] = useState<Set<string>>(new Set());
+  const [loadedKey, setLoadedKey] = useState('');
+  const [decimals, setDecimals] = useState(0);
+
+  const [result, setResult] = useState<RunResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState('');
+
+  const [cells, setCells] = useState<Cells>({});
+  const [manualPool, setManualPool] = useState<Record<string, number>>({});
+  const [basis, setBasis] = useState<Record<string, Basis>>({});
+  const [ccOptions, setCcOptions] = useState<{ name: string; label: string }[]>([]);
+  const [gridCcs, setGridCcs] = useState<string[]>([]);
+  // Rows taken off the grid. Held until Save so a mis-click can be undone by
+  // pressing Reload, and so the backend knows what to delete — an emptied row
+  // cannot say "delete me", because a zero head count is a real value.
+  const [removed, setRemoved] = useState<string[]>([]);
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState('');
+  const [captureOpen, setCaptureOpen] = useState(false);
+  const [evidence, setEvidence] = useState<{ cc: string; month: number } | null>(null);
+  const [unassignedOpen, setUnassignedOpen] = useState(false);
+  // Checked on load, not only when someone opens Capture — the whole point is
+  // that it is visible before the report is trusted.
+  const [unassignedCount, setUnassignedCount] = useState(0);
+
+  const activeRule = rules.find((r) => r.name === rule) || null;
+
+  useEffect(() => { setActiveCompany(company); }, [company]);
+
+  // v2.88.8 — the company list is what the rest of the page waits on, and the
+  // server returns an empty list (not an error) when it hits a database
+  // hiccup. A blank company used to mean no rules were ever requested, so a
+  // transient failure looked like "No rules defined". Retry, and if it still
+  // fails fall back to the rules themselves, which carry their own company.
+  const loadCompanies = useCallback((attempt = 0) => {
+    api.listCompanies()
+      .then((cs: any[]) => {
+        if (cs?.length) { setCompanies(cs); setCompany((cur) => cur || cs[0].name); return; }
+        if (attempt < 2) setTimeout(() => loadCompanies(attempt + 1), 1500);
+        else setErr(t('Could not load the company list.'));
+      })
+      .catch(() => {
+        if (attempt < 2) setTimeout(() => loadCompanies(attempt + 1), 1500);
+        else setErr(t('Could not load the company list.'));
+      });
+  }, []);
+  useEffect(() => { loadCompanies(); }, [loadCompanies]);
+
+  useEffect(() => {
+    // No company yet (list still loading or failed): ask for every active rule.
+    api.allocationRules(company || null)
+      .then((rs) => {
+        setRules(rs || []);
+        if (rs?.length && !rs.some((r) => r.name === rule)) setRule(rs[0].name);
+        if (!company && rs?.length && (rs[0] as any).company) setCompany((rs[0] as any).company);
+      })
+      .catch((e: any) => setErr(e?.message || t('Could not load allocation rules.')));
+    if (company) api.allocationCostCenters(company).then(setCcOptions).catch(() => setCcOptions([]));
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberate (v2.91.0 review): reads rule once to pick a default; re-running on every change of it would be wrong
+  }, [company, tick]);
+
+  // When the picker is empty, say why instead of implying nothing is set up.
+  useEffect(() => {
+    if (rules.length) { setDiag(null); setWhy(false); return; }
+    api.allocationRulesDiagnostic(company || '')
+      .then((d: any) => { setDiag(d); if (d?.reason && d.reason !== 'ok') setWhy(true); })
+      .catch((e: any) => { setDiag({ reason: 'read_error', error: e?.message || String(e) }); setWhy(true); });
+  }, [company, rules.length, tick]);
+
+  const run = useCallback(() => {
+    if (!rule) return;
+    const seq = ++runSeq.current;
+    setLoading(true); setErr('');
+    api.allocationRun(rule, year, company)
+      .then((r) => { if (seq === runSeq.current) setResult(r as RunResult); })
+      .catch((e: any) => {
+        if (seq !== runSeq.current) return;
+        setErr(e?.message || t('Run failed.')); setResult(null);
+      })
+      .finally(() => { if (seq === runSeq.current) setLoading(false); });
+  }, [rule, year, company]);
+
+  const loadGrid = useCallback(() => {
+    if (!rule) return;
+    const seq = ++gridSeq.current;
+    setErr('');
+    setGridLoaded(false);
+    setLoadedKey('');
+    api.allocationGrid(rule, year, company)
+      .then((g: any) => {
+        if (seq !== gridSeq.current) return;     // a newer load has started
+        setEntryCount(typeof g.entry_count === 'number' ? g.entry_count : null);
+        setFrozenCells(new Set(g.frozen || []));
+        setLoadedKey(`${rule}|${year}`);
+        setCells(g.cells || {});
+        setBasis(g.basis || {});
+        setManualPool(g.manual_pool || {});
+        setGridCcs(g.cost_centers || []);
+        setGridLoaded(true);
+        setRemoved([]);
+        setDirty(false); setSaveMsg('');
+      })
+      .catch((e: any) => {
+        if (seq !== gridSeq.current) return;
+        setErr(e?.message || t('Could not load the entry grid.'));
+      });
+  }, [rule, year, company]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- deliberate (v2.91.0 review): loadGrid and run is recreated each render; the effect runs on the listed inputs only
+  useEffect(() => { if (rule) { run(); loadGrid(); } }, [rule, year]);
+
+  useEffect(() => {
+    if (!rule || activeRule?.driver_source !== 'employee_headcount') { setUnassignedCount(0); return; }
+    let alive = true;
+    api.allocationUnassigned(rule, year)
+      .then((r: any) => { if (alive) setUnassignedCount(r?.total_people || 0); })
+      .catch(() => { if (alive) setUnassignedCount(0); });
+    return () => { alive = false; };
+  }, [rule, year, activeRule?.driver_source]);
+
+  function setCell(cc: string, m: number, raw: string) {
+    const v = raw === '' ? 0 : Number(raw);
+    if (!isFinite(v)) return;
+    const field = (basis[cc] || 'head_count') === 'amount' ? 'amount' : 'driver';
+    setCells((cur) => {
+      const prev = cur[cc]?.[m];
+      const cell = { driver: prev?.driver ?? 0, amount: prev?.amount ?? 0,
+                     budget: prev?.budget ?? 0, [field]: v };
+      return { ...cur, [cc]: { ...(cur[cc] || {}), [m]: cell } };
+    });
+    setDirty(true);
+  }
+
+  /** v2.78.0 — budget is entered, never derived, and is independent of the
+   *  basis: a head-count cost centre carries one just as an amount one does.
+   *  Kept as its own setter rather than a `field` argument to setCell, because
+   *  driver and amount are mutually exclusive and budget is not — folding them
+   *  together is how a budget would end up overwriting a driver. */
+  function setBudget(cc: string, m: number, raw: string) {
+    const v = raw === '' ? 0 : Number(raw);
+    if (!isFinite(v)) return;
+    setCells((cur) => {
+      const prev = cur[cc]?.[m];
+      const cell = { driver: prev?.driver ?? 0, amount: prev?.amount ?? 0, budget: v };
+      return { ...cur, [cc]: { ...(cur[cc] || {}), [m]: cell } };
+    });
+    setDirty(true);
+  }
+
+  function setRowBasis(cc: string, b: Basis) {
+    // Switching basis clears the row. The two columns are not
+    // interchangeable — a head count of 8 is not an amount of 8 — and
+    // carrying the old figures across is how a number ends up in the wrong
+    // column without anyone noticing.
+    setBasis((cur) => ({ ...cur, [cc]: b }));
+    setCells((cur) => ({ ...cur, [cc]: {} }));
+    setDirty(true);
+  }
+
+  function addCostCenter(cc: string, to: Basis) {
+    if (!cc || gridCcs.includes(cc)) return;
+    setGridCcs((c) => [...c, cc].sort());
+    setBasis((b) => ({ ...b, [cc]: to }));
+    setRemoved((r) => r.filter((x) => x !== cc));
+    setDirty(true);
+  }
+
+  function removeCostCenter(cc: string) {
+    const hasData = Object.values(cells[cc] || {})
+      .some((v) => Number(v?.driver || 0) || Number(v?.amount || 0) || Number(v?.budget || 0));
+    if (hasData && !confirm(t('Remove this cost centre and its entered values from the rule?'))) return;
+    setGridCcs((c) => c.filter((x) => x !== cc));
+    setCells((cur) => { const n = { ...cur }; delete n[cc]; return n; });
+    setRemoved((r) => (r.includes(cc) ? r : [...r, cc]));
+    setDirty(true);
+  }
+
+  async function save(confirmBulk = false) {
+    if (loadedKey !== `${rule}|${year}`) {
+      setErr(t('This grid belongs to a different rule or year than the one selected. Press Reload.'));
+      return;
+    }
+    setSaving(true); setSaveMsg(''); setErr('');
+    try {
+      // Send every cost centre on the grid, including ones emptied out — the
+      // backend deletes blank rows, which is how a cost centre is removed
+      // from a rule without a separate delete action.
+      const payload: Cells = {};
+      for (const cc of gridCcs) payload[cc] = cells[cc] || {};
+      const res: any = await api.allocationSaveGrid(
+        rule, year, company, payload, manualPool, basis, removed, entryCount, confirmBulk);
+      setDirty(false);
+      setRemoved([]);
+      setSaveMsg(t('Saved') + ` · ${res?.written ?? 0} ` + t('rows')
+        + (res?.deleted ? ` · ${res.deleted} ` + t('cleared') : '')
+        + (res?.overrides ? ` · ${res.overrides} ` + t('marked as overridden') : '')
+        + (res?.skipped_frozen ? ` · ${res.skipped_frozen} ` + t('frozen cell(s) left unchanged') : ''));
+      if (res?.skipped_frozen) {
+        setErr(t('Frozen months are never changed by Save') + ': '
+          + (res.skipped_frozen_cells || []).join(', '));
+      }
+      loadGrid();
+      run();
+    } catch (e: any) {
+      const m = String(e?.message || '');
+      if (m.includes('BULK_DELETE') && !confirmBulk) {
+        setSaving(false);
+        const detail = m.split('BULK_DELETE:')[1] || '';
+        if (confirm(t('Blank cells will delete stored figures.') + detail + '\n\n'
+          + t('A snapshot is taken first, so this can be undone from Backup > Snapshots. Continue?'))) {
+          return save(true);
+        }
+        setErr(t('Not saved.'));
+        return;
+      }
+      if (m.includes('GRID_STALE')) {
+        setErr((m.split('GRID_STALE:')[1] || m).trim());
+        return;
+      }
+      setErr(m || t('Save failed.'));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  /* ── the report document, shared by screen and all five exports ────────── */
+  const buildDoc = useCallback((): ReportDoc | null => {
+    if (!result) return null;
+    const ccs = result.cost_centers;
+    const lbl = (cc: string) => result.cost_center_labels[cc] || cc;
+    const money = (v: number) => ({ v: Number(v || 0), text: fmtD(Number(v || 0), decimals), num: true as const });
+    const rows: DocRow[] = [];
+
+    rows.push({ kind: 'sec', cells: [{ v: t('Allocated to cost centre'), colSpan: ccs.length + 3, bold: true }] });
+    for (const m of result.months) {
+      const b = result.by_month[String(m)];
+      if (!b) continue;
+      rows.push({
+        cells: [
+          { v: MONTHS[m - 1] },
+          money(b.pool),
+          ...ccs.map((cc) => money(b.allocation[cc] || 0)),
+          money(b.allocated),
+        ],
+      });
+    }
+    rows.push({
+      kind: 'grand',
+      cells: [
+        { v: t('YTD'), bold: true },
+        { ...money(result.ytd_pool), bold: true },
+        ...ccs.map((cc) => ({ ...money(result.ytd[cc] || 0), bold: true })),
+        { ...money(ccs.reduce((s, cc) => s + (result.ytd[cc] || 0), 0)), bold: true },
+      ],
+    });
+
+    rows.push({ kind: 'gap', cells: [] });
+    rows.push({ kind: 'sec', cells: [{ v: result.driver_label, colSpan: ccs.length + 3, bold: true }] });
+    for (const m of result.months) {
+      const b = result.by_month[String(m)];
+      if (!b) continue;
+      rows.push({
+        cells: [
+          { v: MONTHS[m - 1] },
+          { v: '', num: true },
+          ...ccs.map((cc) => ({ v: Number(b.drivers[cc] || 0), text: String(b.drivers[cc] ?? ''), num: true as const })),
+          { v: Number(b.driver_total || 0), text: String(b.driver_total || 0), num: true as const },
+        ],
+      });
+    }
+
+    const drift = Math.abs(result.ytd_residual) > 0.01
+      ? t('Unallocated remainder') + ': ' + fmtD(result.ytd_residual, 2)
+        + ' — ' + t('some months carry no driver value.')
+      : undefined;
+
+    return {
+      title: result.title,
+      subtitle: `${result.driver_label} · ${result.year}`,
+      company: result.company,
+      companyLabel: result.company,
+      period: String(result.year),
+      columns: [
+        { label: t('Month'), width: 12 },
+        { label: t('Pool'), num: true, width: 16 },
+        ...ccs.map((cc) => ({ label: lbl(cc), num: true, width: 16 })),
+        { label: t('Total'), num: true, width: 16 },
+      ],
+      rows,
+      fileBase: 'allocation_' + (result.title || 'report').toLowerCase().replace(/[^a-z0-9]+/g, '_'),
+      orientation: 'landscape',
+      note: drift,
+    };
+  }, [result, decimals]);
+
+  const gridTotals = useMemo(() => {
+    const out: Record<number, number> = {};
+    for (let m = 1; m <= 12; m++) {
+      out[m] = gridCcs
+        .filter((cc) => (basis[cc] || 'head_count') === 'head_count')
+        .reduce((s, cc) => s + Number(cells[cc]?.[m]?.driver || 0), 0);
+    }
+    return out;
+  }, [cells, gridCcs, basis]);
+
+  return (
+    <div className="alloc-page">
+      <nav className="view-subtabs" role="tablist">
+        <button role="tab" aria-selected={view === 'report'}
+          className={'view-subtab' + (view === 'report' ? ' is-active' : '')}
+          onClick={() => setView('report')}>{t('Report')}</button>
+        <button role="tab" aria-selected={view === 'data'}
+          className={'view-subtab' + (view === 'data' ? ' is-active' : '')}
+          onClick={() => setView('data')}>{t('Data entry')}</button>
+      </nav>
+
+      <div className="filters-card">
+        <div className="filter-grid">
+          <label>{t('Company')}
+            <select value={company} onChange={(e) => setCompany(e.target.value)}>
+              {companies.map((c) => <option key={c.name} value={c.name}>{c.label || c.name}</option>)}
+            </select>
+          </label>
+          <label>{t('Allocation')}
+            <select value={rule} onChange={(e) => setRule(e.target.value)}>
+              {!rules.length && <option value="">{t('No rules defined')}</option>}
+              {rules.map((r) => <option key={r.name} value={r.name}>{r.title}</option>)}
+            </select>
+          </label>
+          <label>{t('Year')}
+            <input type="number" value={yearText} min={2000} max={2100}
+              onChange={(e) => {
+                const v = e.target.value;
+                setYearText(v);
+                const n = parseInt(v, 10);
+                if (/^\d{4}$/.test(v) && n >= 2000 && n <= 2100) setYear(n);
+              }}
+              onBlur={() => setYearText(String(year))} />
+          </label>
+          <label>{t('Decimals')}
+            <select value={decimals} onChange={(e) => setDecimals(parseInt(e.target.value))}>
+              <option value={0}>0</option><option value={2}>2</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="action-row">
+          <button onClick={run} disabled={!rule || loading}>{loading ? t('Running…') : t('Run')}</button>
+          <button onClick={() => setDiagOpen(true)} disabled={!rule} title={t('Check every step from stored figures to the allocated result')}>{t('Diagnose')}</button>
+          {view === 'report' && (
+            <ExportBar reportKey="allocation" reportLabel={t('Allocation')} company={company} companyLabel={company} disabled={!result} getDoc={buildDoc} />
+          )}
+          {view === 'data' && (
+            <>
+              <button onClick={() => save()} disabled={!dirty || saving}>
+                {saving ? t('Saving…') : t('Save')}
+              </button>
+              <button onClick={loadGrid} disabled={saving}>{t('Reload')}</button>
+              <button onClick={() => setImportOpen(true)} disabled={saving || !rule}>{t('Paste figures')}</button>
+              {activeRule?.driver_source === 'employee_headcount' && (
+                <button onClick={() => setCaptureOpen(true)} disabled={saving}>
+                  {t('Capture from HR')}
+                </button>
+              )}
+              {saveMsg && <span className="alloc-ok">{saveMsg}</span>}
+              {dirty && !saving && (
+            <span className="alloc-dirty">
+              {t('Unsaved changes')}
+              {!!removed.length && ` · ${removed.length} ` + t('row(s) will be removed')}
+            </span>
+          )}
+            </>
+          )}
+          {err && <span className="ni-exp-err">{err}</span>}
+        </div>
+
+        {activeRule && (
+          <p className="alloc-hint">
+            {activeRule.pool_mode === 'report_row'
+              ? (activeRule.pool_row_key
+                  ? t('Pool read from') + ` ${activeRule.pool_report} · ${activeRule.pool_row_key}`
+                    + (activeRule.pool_cost_center ? ` · ${activeRule.pool_cost_center}` : '')
+                  : t('Pool source not configured yet — set the report, row and cost centre on the rule.'))
+              : activeRule.pool_mode === 'flag'
+                ? (activeRule.pool_flag
+                    ? t('Pool read from the GL via flag') + ` “${activeRule.pool_flag}”`
+                    : t('Pool source not configured yet — no flag set on the rule.'))
+                : t('Pool entered by hand, per month')}
+            {' · '}{t('Amounts entered directly are taken out of the pool first; what is left is spread on')} {activeRule.driver_label}.
+          </p>
+        )}
+      </div>
+
+      {unassignedCount > 0 && (
+        <div className="alloc-warn alloc-preflight">
+          <span>
+            <strong>{unassignedCount} {t('employees have no cost centre')}</strong>{' — '}
+            {t('they fall out of the denominator, so every cost centre below is taking a larger share than it should. The totals will still tie, so nothing else will flag it.')}
+          </span>
+          <button type="button" className="bk-btn" onClick={() => setUnassignedOpen(true)}>
+            {t('Review list')}
+          </button>
+        </div>
+      )}
+
+      {result?.pool_status && result.pool_status.state !== 'ok' && rule && (
+        <PoolStatus status={result.pool_status} rule={rule} onFixed={run} />
+      )}
+
+      {rule && gridLoaded && loadedKey === `${rule}|${year}` && entryCount === 0 && (
+        <div className="alloc-warn" style={{ display: 'flex', gap: 12, alignItems: 'center', justifyContent: 'space-between' }}>
+          <span>
+            <strong>{t('No head-count or amount entries are stored for')} {rule} {t('in')} {year}.</strong>{' '}
+            {t('The rule exists but its figures are missing, so nothing can be allocated.')}
+            {gridCcs.length > 0 && <> {t('Its cost centres are listed under Data entry, ready to type into or paste over.')}</>}
+            {' '}<button type="button" className="bk-btn" onClick={() => setDiagOpen(true)}>{t('Diagnose')}</button>
+          </span>
+          <span style={{ display: 'flex', gap: 8 }}>
+            <button type="button" className="bk-btn" onClick={() => setRecoverOpen(true)}>{t('Find my data')}</button>
+            <button type="button" className="bk-btn" onClick={() => setImportOpen(true)}>{t('Paste figures')}</button>
+          </span>
+        </div>
+      )}
+      {importOpen && rule && (
+        <ImportHeadCountsModal rule={rule} year={year} onClose={() => setImportOpen(false)}
+          onDone={() => { loadGrid(); run(); }} />
+      )}
+      {diagOpen && rule && (
+        <DiagnoseModal rule={rule} year={year} company={company} onClose={() => setDiagOpen(false)}
+          onChanged={() => { loadGrid(); run(); }}
+          onOpenRecovery={() => setRecoverOpen(true)} onOpenPaste={() => setImportOpen(true)} />
+      )}
+      {recoverOpen && rule && (
+        <EntriesRecoveryModal rule={rule} year={year} onClose={() => setRecoverOpen(false)}
+          onDone={() => { loadGrid(); run(); }} />
+      )}
+
+      {!rules.length && (
+        <div className="alloc-empty">
+          <h3>{t('No allocation rules yet')}</h3>
+          <p>{t('Create an Insight Allocation Rule in the desk — one per pool, e.g. GMO Allocation (driver: head count) and Sales & Marketing Allocation (driver: leads count). Point it at the account flag that holds the pool cost, then enter the driver values under Data entry.')}</p>
+          {/* Rules are deliberately never seeded: a pool and its driver are
+              specific to one company's cost structure, and a guessed default
+              would put invented numbers into management accounts. But "not set
+              up yet" should not look like "failed to load", so link the way in. */}
+          {diag && (
+            <p>
+              <button type="button" className="bk-btn" onClick={() => setWhy(true)}>
+                ⚠ {t('Why is this empty?')}
+              </button>
+            </p>
+          )}
+          <p><a className="vs-btn" href={deskPrefix() + '/insight-allocation-rule/new'} target="_blank" rel="noopener noreferrer">
+            {t('Create an allocation rule')}</a></p>
+        </div>
+      )}
+
+      {why && diag && (
+        <NoRulesModal diag={diag} company={company} onClose={() => setWhy(false)}
+          onRetry={() => { setWhy(false); setTick((n) => n + 1); }} />
+      )}
+
+      {view === 'report' && result && (
+        <AllocReport result={result} decimals={decimals} onEvidence={setEvidence} />
+      )}
+
+      {unassignedOpen && rule && (
+        <UnassignedModal rule={rule} year={year} onClose={() => setUnassignedOpen(false)} />
+      )}
+      {captureOpen && rule && (
+        <CaptureModal rule={rule} year={year}
+          ccLabel={(cc) => ccOptions.find((o) => o.name === cc)?.label || cc}
+          onClose={() => setCaptureOpen(false)}
+          onSaved={() => { loadGrid(); run(); }} />
+      )}
+      {evidence && rule && (
+        <EvidenceModal rule={rule} costCenter={evidence.cc} year={year} month={evidence.month}
+          ccLabel={result?.cost_center_labels?.[evidence.cc] || evidence.cc}
+          onClose={() => setEvidence(null)} />
+      )}
+
+      {view === 'data' && rule && (
+        <div className="alloc-grid-wrap">
+          {/* Two tables, kept apart on purpose. A cost centre belongs to one
+              or the other, and there is no column in either that a calculated
+              allocation can be typed into. */}
+          {(['head_count', 'amount'] as Basis[]).map((tbl) => {
+            const rowsFor = gridCcs.filter((cc) => (basis[cc] || 'head_count') === tbl);
+            return (
+              <div className="alloc-table-block" key={tbl}>
+                <div className="alloc-table-head">
+                  <h4>{tbl === 'head_count'
+                    ? (activeRule?.driver_label || t('Head count'))
+                    : t('Amount')}</h4>
+                  <span>{tbl === 'head_count'
+                    ? t('the amount is calculated from each row\'s share of this table\'s total')
+                    : t('no head count — the amount is entered directly and comes out of the pool first')}</span>
+                </div>
+                <table className="alloc-grid">
+                  <thead>
+                    <tr>
+                      <th className="sticky-l">{t('Cost centre')}</th>
+                      {MONTHS.map((mm) => <th key={mm} className="num">{t(mm)}</th>)}
+                      <th className="num">{t('YTD')}</th>
+                      <th />
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {!rowsFor.length && (
+                      <tr><td className="sticky-l alloc-none" colSpan={15}>
+                        {t('No cost centres in this table yet.')}
+                      </td></tr>
+                    )}
+                    {rowsFor.map((cc) => {
+                      const isAmt = tbl === 'amount';
+                      const tot = MONTHS.reduce((sum, _, i) =>
+                        sum + Number((isAmt ? cells[cc]?.[i + 1]?.amount : cells[cc]?.[i + 1]?.driver) || 0), 0);
+                      return (
+                        <tr key={cc}>
+                          <td className="sticky-l">{ccOptions.find((o) => o.name === cc)?.label || cc}</td>
+                          {MONTHS.map((_, i) => (
+                            <td key={i} className="num">
+                              <input type="number" step="any"
+                                className={'alloc-in' + (frozenCells.has(`${cc}|${i + 1}`) ? ' alloc-frozen' : '')}
+                                readOnly={frozenCells.has(`${cc}|${i + 1}`)}
+                                title={frozenCells.has(`${cc}|${i + 1}`) ? t('Frozen month — Save never changes it') : undefined}
+                                value={(isAmt ? cells[cc]?.[i + 1]?.amount : cells[cc]?.[i + 1]?.driver) ?? ''}
+                                onChange={(e) => setCell(cc, i + 1, e.target.value)} />
+                            </td>
+                          ))}
+                          <td className="num alloc-rt">{isAmt ? fmtD(tot, 0) : tot}</td>
+                          <td className="alloc-move">
+                            <button type="button" title={t('Move to the other table')}
+                              aria-label={t('Move to the other table')}
+                              onClick={() => setRowBasis(cc, isAmt ? 'head_count' : 'amount')}>⇄</button>
+                            <button type="button" className="alloc-del"
+                              title={t('Remove this cost centre from the rule')}
+                              aria-label={t('Remove this cost centre from the rule')}
+                              onClick={() => removeCostCenter(cc)}>×</button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                    {tbl === 'head_count' && !!rowsFor.length && (
+                      <tr className="alloc-tot">
+                        <td className="sticky-l">{t('Total')}</td>
+                        {MONTHS.map((_, i) => <td key={i} className="num">{gridTotals[i + 1] || 0}</td>)}
+                        <td className="num">{Object.values(gridTotals).reduce((a, b2) => a + b2, 0)}</td>
+                        <td />
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+                {tbl === 'head_count' && !!rowsFor.length && (
+                  <p className="alloc-hint">
+                    {t('This total is the denominator — the sum of exactly these rows, never a company-wide figure.')}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+
+          {activeRule?.pool_mode === 'manual' && (
+            <div className="alloc-table-block">
+              <div className="alloc-table-head"><h4>{t('Pool total')}</h4><span>{t('entered by hand')}</span></div>
+              <table className="alloc-grid">
+                <tbody><tr>
+                  <td className="sticky-l">{t('Pool')}</td>
+                  {MONTHS.map((_, i) => (
+                    <td key={i} className="num">
+                      <input type="number" step="any" className="alloc-in"
+                        value={manualPool[String(i + 1)] ?? ''}
+                        onChange={(e) => {
+                          const v = e.target.value === '' ? 0 : Number(e.target.value);
+                          setManualPool((p) => ({ ...p, [String(i + 1)]: v }));
+                          setDirty(true);
+                        }} />
+                    </td>
+                  ))}
+                  <td className="num alloc-rt">
+                    {fmtD(Object.values(manualPool).reduce((a, b2) => a + Number(b2 || 0), 0), 0)}
+                  </td>
+                </tr></tbody>
+              </table>
+            </div>
+          )}
+
+          <div className="alloc-add">
+            <label>{t('Add to head count table')}
+              <select value="" onChange={(e) => addCostCenter(e.target.value, 'head_count')}>
+                <option value="">{t('Choose…')}</option>
+                {ccOptions.filter((o) => !gridCcs.includes(o.name))
+                  .map((o) => <option key={o.name} value={o.name}>{o.label}</option>)}
+              </select>
+            </label>
+            <label>{t('Add to amount table')}
+              <select value="" onChange={(e) => addCostCenter(e.target.value, 'amount')}>
+                <option value="">{t('Choose…')}</option>
+                {ccOptions.filter((o) => !gridCcs.includes(o.name))
+                  .map((o) => <option key={o.name} value={o.name}>{o.label}</option>)}
+              </select>
+            </label>
+            <p className="alloc-hint">
+              {t('Use × to take a cost centre off a table, or ⇄ to move it to the other one. Nothing is deleted until you press Save — Reload undoes it. A blank cell and a zero are different: blank contributes nothing, zero contributes a zero share.')}
+            </p>
+          </div>
+          {/* Budget — one table for every cost centre in the rule, regardless
+              of basis. Separate from the two input tables above because it is
+              a different KIND of number: those drive a calculation, this one is
+              only ever compared against its result. Keeping it here rather than
+              as extra columns is what stops a budget being typed into a driver
+              cell by accident. */}
+          <div className="alloc-table-block">
+            <div className="alloc-table-head">
+              <h4>{t('Budget')}</h4>
+              <span>{t('entered by hand and never derived — shown against the calculated allocation on the report')}</span>
+            </div>
+            <table className="alloc-grid">
+              <thead>
+                <tr>
+                  <th className="sticky-l">{t('Cost centre')}</th>
+                  {MONTHS.map((mm) => <th key={mm} className="num">{t(mm)}</th>)}
+                  <th className="num">{t('YTD')}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {!gridCcs.length && (
+                  <tr><td className="sticky-l alloc-none" colSpan={14}>
+                    {t('Add a cost centre above first.')}
+                  </td></tr>
+                )}
+                {gridCcs.map((cc) => {
+                  const tot = MONTHS.reduce((sum, _, i) =>
+                    sum + Number(cells[cc]?.[i + 1]?.budget || 0), 0);
+                  return (
+                    <tr key={cc}>
+                      <td className="sticky-l">{ccOptions.find((o) => o.name === cc)?.label || cc}</td>
+                      {MONTHS.map((_, i) => (
+                        <td key={i} className="num">
+                          <input type="number" step="any" className="alloc-in"
+                            value={cells[cc]?.[i + 1]?.budget ?? ''}
+                            onChange={(e) => setBudget(cc, i + 1, e.target.value)} />
+                        </td>
+                      ))}
+                      <td className="num alloc-rt">{fmtD(tot, 0)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── report table: cost centres across, months down ───────────────────────── */
+
+function AllocReport({ result, decimals, onEvidence }: {
+  result: RunResult; decimals: number;
+  // Passed in rather than reached for: this component is rendered separately
+  // from the state that opens the evidence dialog.
+  onEvidence: (sel: { cc: string; month: number }) => void;
+}) {
+  const ccs = result.cost_centers;
+  const lbl = (cc: string) => result.cost_center_labels[cc] || cc;
+  const drift = Math.abs(result.ytd_residual) > 0.01;
+
+  if (!ccs.length) {
+    return (
+      <div className="alloc-empty">
+        <h3>{t('Nothing to allocate yet')}</h3>
+        <p>{t('No driver values have been entered for this rule and year. Switch to Data entry and add the head count or leads count per cost centre.')}</p>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      {!!result.mixed?.length && (
+        <div className="alloc-warn">
+          {t('These cost centres change basis part-way through the year, which is almost always a mistake')}:{' '}
+          <strong>{result.mixed.map(lbl).join(', ')}</strong>.{' '}
+          {t('Set one basis for the whole year under Data entry.')}
+        </div>
+      )}
+      <div className="alloc-meta">
+        <span><i className="ti ti-database" aria-hidden /> {result.pool_source}</span>
+        <span><i className="ti ti-math-function" aria-hidden /> <code>{result.formula}</code></span>
+        {!!result.credit_back && (
+          <span className="alloc-meta-ok">
+            <i className="ti ti-check" aria-hidden /> {t('source cost centre credited — company total unchanged')}
+          </span>
+        )}
+      </div>
+      {!!result.formula_errors?.length && (
+        <div className="alloc-warn">
+          {t('The formula could not be evaluated in')}{' '}
+          <strong>{result.formula_errors.map((m) => MONTHS[m - 1]).join(', ')}</strong>.{' '}
+          {t('Those months show zero. Check the expression on the rule.')}
+        </div>
+      )}
+      {drift && (
+        <div className="alloc-warn">
+          {t('Unallocated remainder')}: <strong>{fmtD(result.ytd_residual, 2)}</strong>{' — '}
+          {t('one or more months have a pool but no driver value, so that share could not be spread. It is excluded from the cost centre columns.')}
+        </div>
+      )}
+      <div className="alloc-report-wrap">
+        <table className="alloc-report">
+          <thead>
+            <tr>
+              <th className="sticky-l">{t('Month')}</th>
+              <th className="num">{t('Pool')}</th>
+              {ccs.map((cc) => (
+                <th key={cc} className="num">
+                  {lbl(cc)}
+                  {/* A fixed-only centre takes its amount and no share of the
+                      remainder. Saying so on the column head means the number
+                      underneath never has to be explained twice. */}
+                  {result.roles?.[cc] === 'amount' && <span className="alloc-tag">{t('amount')}</span>}
+                  {result.roles?.[cc] === 'credit' && <span className="alloc-tag alloc-tag-credit">{t('credit')}</span>}
+                  {result.roles?.[cc] === 'mixed' && <span className="alloc-tag alloc-tag-warn">{t('basis changes')}</span>}
+                </th>
+              ))}
+              <th className="num">{t('Allocated')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.months.map((m) => {
+              const b = result.by_month[String(m)];
+              if (!b) return null;
+              return (
+                <tr key={m} className={b.unallocated ? 'alloc-row-warn' : b.no_pool ? 'alloc-row-nopool' : ''}>
+                  <td className="sticky-l">{t(MONTHS[m - 1])}</td>
+                  <td className="num">{fmtD(b.pool, decimals)}</td>
+                  {ccs.map((cc) => <td key={cc} className="num">{fmtD(b.allocation[cc] || 0, decimals)}</td>)}
+                  <td className="num">{b.no_pool ? <span className="alloc-nopool-tag">{t('no pool')}</span> : fmtD(b.allocated, decimals)}</td>
+                </tr>
+              );
+            })}
+            <tr className="alloc-tot">
+              <td className="sticky-l">{t('YTD')}</td>
+              <td className="num">{fmtD(result.ytd_pool, decimals)}</td>
+              {ccs.map((cc) => <td key={cc} className="num">{fmtD(result.ytd[cc] || 0, decimals)}</td>)}
+              <td className="num">
+                {fmtD(ccs.reduce((s, cc) => s + (result.ytd[cc] || 0), 0), decimals)}
+              </td>
+            </tr>
+            {/* v2.78.0 — budget beside the derived actual, and the variance
+                between them. Rendered only when a budget has actually been
+                entered: two rows of zeros on every rule that has none would
+                read as "budget is nil", which is a different statement from
+                "no budget was set". */}
+            {!!result.budget_total && (
+              <>
+                <tr className="alloc-tot alloc-budget">
+                  <td className="sticky-l">{t('Budget YTD')}</td>
+                  <td className="num">—</td>
+                  {ccs.map((cc) => (
+                    <td key={cc} className="num">{fmtD(result.budget_ytd?.[cc] || 0, decimals)}</td>
+                  ))}
+                  <td className="num">{fmtD(result.budget_total || 0, decimals)}</td>
+                </tr>
+                <tr className="alloc-tot alloc-variance">
+                  <td className="sticky-l">{t('Variance')}</td>
+                  <td className="num">—</td>
+                  {ccs.map((cc) => {
+                    const v = result.variance_ytd?.[cc] || 0;
+                    return (
+                      <td key={cc} className={'num' + (v > 0.005 ? ' alloc-over' : '')}
+                        title={v > 0 ? t('Allocated more than budget') : t('Allocated less than budget')}>
+                        {fmtD(v, decimals)}
+                      </td>
+                    );
+                  })}
+                  <td className="num">
+                    {fmtD(ccs.reduce((s, cc) => s + (result.variance_ytd?.[cc] || 0), 0), decimals)}
+                  </td>
+                </tr>
+              </>
+            )}
+            <tr className="alloc-sec"><td className="sticky-l" colSpan={ccs.length + 3}>{result.driver_label}</td></tr>
+            {result.months.map((m) => {
+              const b = result.by_month[String(m)];
+              if (!b) return null;
+              return (
+                <tr key={'d' + m} className="alloc-driver">
+                  <td className="sticky-l">{t(MONTHS[m - 1])}</td>
+                  <td className="num" />
+                  {ccs.map((cc) => (
+                    <td key={cc} className="num">
+                      {b.drivers[cc] === undefined ? '' : (
+                        // The count is the link to its own supporting list —
+                        // an auditor should never have to ask where it came from.
+                        <button type="button" className="ev-link"
+                          title={t('Show the employees behind this count')}
+                          onClick={() => onEvidence({ cc, month: m })}>{b.drivers[cc]}</button>
+                      )}
+                    </td>
+                  ))}
+                  <td className="num">{b.driver_total || ''}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </>
+  );
+}
+
+export default AllocationApp;
