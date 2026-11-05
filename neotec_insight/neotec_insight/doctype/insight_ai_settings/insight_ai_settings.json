@@ -1,0 +1,285 @@
+{
+ "actions": [],
+ "creation": "2026-01-01 00:00:00",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "ai_section",
+  "ai_enabled",
+  "ai_provider",
+  "ai_endpoint",
+  "ai_model",
+  "ai_api_key",
+  "ai_col",
+  "ai_max_tokens",
+  "ai_timeout_seconds",
+  "ai_api_version",
+  "ai_fallback_section",
+  "ai_fallback_model",
+  "ai_fallback_provider",
+  "ai_fallback_col",
+  "ai_fallback_endpoint",
+  "ai_fallback_api_key",
+  "ai_system_prompt",
+  "loc_section",
+  "default_language",
+  "ar_labels_section",
+  "arabic_label_sources",
+  "sb_bank_reader",
+  "ollama_url",
+  "ollama_text_model",
+  "ollama_vision_model",
+  "company_aliases",
+  "bank_charges_account",
+  "input_vat_account",
+  "print_org_name",
+  "print_org_address",
+  "print_logo_url",
+  "vacation_days_per_year",
+  "ticket_source",
+  "insurance_source"
+ ],
+ "fields": [
+  {
+   "fieldname": "ai_section",
+   "fieldtype": "Section Break",
+   "label": "AI Engine (NeoNexus / OpenAI-compatible)"
+  },
+  {
+   "fieldname": "ai_enabled",
+   "fieldtype": "Check",
+   "label": "Enable Neotec AI",
+   "default": "0",
+   "description": "When on, the Ask Neotec AI panel on the Reports screen sends live report figures to the endpoint below."
+  },
+  {
+   "fieldname": "ai_provider",
+   "fieldtype": "Select",
+   "label": "AI Provider",
+   "options": "OpenAI-compatible\nAnthropic (Claude)\nAzure OpenAI",
+   "default": "OpenAI-compatible",
+   "description": "OpenAI-compatible covers OpenAI, Google Gemini, Ollama, Groq, Mistral, DeepSeek, OpenRouter, vLLM and LM Studio. Use Anthropic (Claude) for Claude, and Azure OpenAI for OpenAI models hosted on Azure."
+  },
+  {
+   "fieldname": "ai_endpoint",
+   "fieldtype": "Data",
+   "label": "AI Endpoint (OpenAI-compatible base URL)",
+   "default": "http://host.docker.internal:11434/v1",
+   "description": "OpenAI: https://api.openai.com/v1 · Gemini: https://generativelanguage.googleapis.com/v1beta/openai/ · Ollama: http://<host>:11434/v1 · Claude: leave blank (https://api.anthropic.com) · Azure: https://<resource>.openai.azure.com"
+  },
+  {
+   "fieldname": "ai_model",
+   "fieldtype": "Data",
+   "label": "Model",
+   "default": "llama3.3",
+   "description": "The provider's model name, e.g. gpt-4.1-mini, gemini-3.8-flash, llama3.3, claude-sonnet-5-5. For Azure, the deployment name."
+  },
+  {
+   "fieldname": "ai_api_key",
+   "fieldtype": "Password",
+   "label": "API Key (optional)",
+   "description": "Leave blank for local engines (Ollama/LM Studio)."
+  },
+  {
+   "fieldname": "ai_col",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "ai_max_tokens",
+   "fieldtype": "Int",
+   "label": "Max Answer Tokens",
+   "default": "4096",
+   "description": "Upper limit for one answer. Claude requires a limit; others use it if given."
+  },
+  {
+   "fieldname": "ai_timeout_seconds",
+   "fieldtype": "Int",
+   "label": "Timeout (seconds)",
+   "default": "120",
+   "description": "How long one call may take. Calls run in the background, so this is not limited by the web gateway."
+  },
+  {
+   "fieldname": "ai_api_version",
+   "fieldtype": "Data",
+   "label": "Azure API Version",
+   "default": "2024-10-21",
+   "depends_on": "eval:doc.ai_provider=='Azure OpenAI'"
+  },
+  {
+   "fieldname": "ai_fallback_section",
+   "fieldtype": "Section Break",
+   "label": "Fallback model",
+   "collapsible": 1,
+   "description": "Used only when the main model is still overloaded or rate-limited after three retries. Leave the model blank for no fallback."
+  },
+  {
+   "fieldname": "ai_fallback_model",
+   "fieldtype": "Data",
+   "label": "Fallback Model",
+   "description": "e.g. gemini-2.5-flash on the same provider, or claude-haiku-5-5 with the Claude provider below."
+  },
+  {
+   "fieldname": "ai_fallback_provider",
+   "fieldtype": "Select",
+   "label": "Fallback Provider",
+   "options": "\nOpenAI-compatible\nAnthropic (Claude)\nAzure OpenAI",
+   "description": "Blank = same as the main provider."
+  },
+  {
+   "fieldname": "ai_fallback_col",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "ai_fallback_endpoint",
+   "fieldtype": "Data",
+   "label": "Fallback Endpoint",
+   "description": "Blank = the main endpoint (same provider) or the provider's default (Claude)."
+  },
+  {
+   "fieldname": "ai_fallback_api_key",
+   "fieldtype": "Password",
+   "label": "Fallback API Key",
+   "description": "Blank = the main key (same provider only)."
+  },
+  {
+   "fieldname": "ai_system_prompt",
+   "fieldtype": "Small Text",
+   "label": "System Prompt (optional)",
+   "description": "Override the default analyst persona. Leave blank to use the built-in prompt."
+  },
+  {
+   "fieldname": "loc_section",
+   "fieldtype": "Section Break",
+   "label": "Localization"
+  },
+  {
+   "fieldname": "default_language",
+   "fieldtype": "Select",
+   "label": "Default Language",
+   "options": "en\nar",
+   "default": "en"
+  },
+  {
+   "fieldname": "ar_labels_section",
+   "fieldtype": "Section Break",
+   "label": "Arabic Label Sources",
+   "description": "Map each master to the field that holds its Arabic name. When the UI language is Arabic, accounts / dimensions / company show that field's value. The selectable value (used for filtering) never changes — only the displayed label."
+  },
+  {
+   "fieldname": "arabic_label_sources",
+   "fieldtype": "Table",
+   "label": "Arabic Label Sources",
+   "options": "Insight Arabic Label Source"
+  },
+  {
+   "fieldname": "sb_bank_reader",
+   "fieldtype": "Section Break",
+   "label": "Bank Slip Reader (Ollama)"
+  },
+  {
+   "fieldname": "ollama_url",
+   "fieldtype": "Data",
+   "label": "Ollama URL",
+   "default": "http://localhost:11434",
+   "description": "Local Ollama endpoint. Keeps slip data on-prem (PDPL)."
+  },
+  {
+   "fieldname": "ollama_text_model",
+   "fieldtype": "Data",
+   "label": "Ollama Text Model",
+   "default": "qwen2.5",
+   "description": "Structures digital-PDF text into the slip schema."
+  },
+  {
+   "fieldname": "ollama_vision_model",
+   "fieldtype": "Data",
+   "label": "Ollama Vision Model",
+   "default": "qwen2.5vl",
+   "description": "Reads scanned/image slips (Arabic+English)."
+  },
+  {
+   "fieldname": "company_aliases",
+   "fieldtype": "Small Text",
+   "label": "Company Name Tokens (direction classifier)",
+   "default": "IRSAA, ارساء, إرساء",
+   "description": "Distinctive tokens that identify your company on bank slips. Accounts are read from company Bank Accounts; these cover name-only slips."
+  },
+  {
+   "fieldname": "bank_charges_account",
+   "fieldtype": "Link",
+   "options": "Account",
+   "label": "Default Bank Charges Account"
+  },
+  {
+   "fieldname": "input_vat_account",
+   "fieldtype": "Link",
+   "options": "Account",
+   "label": "Default Input VAT Account (recoverable)"
+  },
+  {
+   "fieldname": "print_org_name",
+   "fieldtype": "Data",
+   "label": "Print: Organisation Name"
+  },
+  {
+   "fieldname": "print_org_address",
+   "fieldtype": "Small Text",
+   "label": "Print: Address / Sub-header"
+  },
+  {
+   "fieldname": "print_logo_url",
+   "fieldtype": "Data",
+   "label": "Print: Logo URL"
+  },
+  {
+   "fieldname": "vacation_days_per_year",
+   "fieldtype": "Int",
+   "label": "Provisions: Vacation Days/Year (0 = auto 21/30)"
+  },
+  {
+   "fieldname": "ticket_source",
+   "fieldtype": "Data",
+   "label": "Provisions: Ticket Source (field:/component:/fixed:)"
+  },
+  {
+   "fieldname": "insurance_source",
+   "fieldtype": "Data",
+   "label": "Provisions: Insurance Source (field:/component:/fixed:)"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-10-20 09:00:00",
+ "module": "Neotec Insight",
+ "name": "Insight AI Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "Accounts Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Accounts User"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 1
+}
